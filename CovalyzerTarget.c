@@ -171,10 +171,11 @@ int main(int argc, char **argv) {
 
 		state->ready = 0;
 		state->processed = 1;
+		// FIX: this worked not well... No coverage dumped, no clue why.
 		//we are done here
-		if(state->modeset & 2){
-			running = 0;
-		}
+		//if(state->modeset & 2){
+		//	running = 0;
+		//}
 	}
 
 	fprintf(stderr, "[CovalyzerTarget] Shutting down\n");

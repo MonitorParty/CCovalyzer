@@ -38,6 +38,7 @@
 #define EXIT_BUFFER 5
 #define PROFRAW_PATTERN "cov-%m.profraw"  // %m allows llvm to merge from multiple processes
 #define EXEC_TIMEOUT 10 
+#define FIRST_TC_TIMESTAMP 1754064325
 
 //implicit declaration of asprintf thingy
 #ifndef _GNU_SOURCE
@@ -51,8 +52,8 @@ typedef struct shm_state {
 	volatile atomic_int ready; // set to one by host when data is ready 
 	volatile atomic_int processed; // set to 1 by target when processing is done 
 	volatile atomic_int target_ready;
-	uint8_t modeset;			       //
-	size_t size; 		// input size 
+	uint8_t modeset;		       //
+	size_t size; 	// input size 
 	uint8_t data[]; 	// flexible array of input data 
 } shm_layout_t;
 
@@ -67,6 +68,12 @@ sqlite3 *db_queue = NULL;
 sqlite3_stmt *stmt = NULL;
 sqlite3_stmt *stmt_restart = NULL;
 sqlite3_stmt *stmt_queue = NULL;
+
+sqlite3_stmt *stmt_seed_files = NULL;
+
+
+
+
 pid_t target_pid;
 uint8_t crashed = 0;
 uint8_t run_dead = 0;
@@ -87,6 +94,7 @@ size_t timeouts = 0;
 size_t last_case;
 size_t next_restart;
 time_t last_execution = 0;
+size_t total_execs;
 pid_t own_pid;
 
 
@@ -98,14 +106,8 @@ char profraw_path[256];
 //time constraint for buckets. 900 is default, which is 15 minutes. 
 size_t bucket_time_limit = 900; 
 
-
-//void set_env(){
-//	if(state_mode == FUZZBENCH){
-//		setenv("LLVM_PROFILE_FILE", profraw_path, 1);
-//	}else{
-//		setenv("LLVM_PROFILE_FILE", PROFRAW_PATTERN, 1);
-//	}
-//}
+long long max_timestamp = 0;
+int max_bucket = -1;
 
 
 // TODO: maybe check if shm is empty or has residue from last run 
@@ -142,9 +144,6 @@ void init_shm() {
 		modeset = 0;
 	}
 
-	if(state_mode == NON_STATEFUL){
-		modeset |= 2;
-	}
 	shm_ptr->modeset = modeset;
 	fprintf(stderr, PREF_OK "SHM ready.\n");
 }
@@ -156,18 +155,16 @@ void cleanup(){
 		}
 	}
 
-	
+
 	if(stmt) sqlite3_finalize(stmt);
 	if(db) sqlite3_close(db);
 	if(shm_ptr) munmap(shm_ptr, SHM_SIZE);
 	if (shm_fd != -1) close(shm_fd);
 	fprintf(stderr, PREF_ERR "Cleanup called!\n");
 	shm_unlink(path);
-	
+
 }
 
-int get_current_bucket(time_t timestamp){
-	return ( (timestamp - first_ts) / 900); }
 
 
 //this method should copy the current cov profile to ./snapshots 
@@ -273,6 +270,141 @@ void setup_term_handler(void){
 	}
 }
 
+
+void query_limit_metadata() {
+	fprintf(stderr, PREF_WARN "Starting max timestamp shit...\n");
+	fflush(stderr);
+
+	sqlite3 *tmp_db;
+	sqlite3_stmt *tmp_stmt;
+	int rc = sqlite3_open_v2(DB_PATH, &tmp_db, SQLITE_OPEN_READONLY, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, PREF_ERR "Cannot open db for timestamp limit: %s\n", sqlite3_errmsg(tmp_db));
+		exit(1);
+	}
+
+	const char *query = "SELECT timestamp FROM testcases WHERE id = ?";
+	rc = sqlite3_prepare_v2(tmp_db, query, -1, &tmp_stmt, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, PREF_ERR "Failed to prepare timestamp query: %s\n", sqlite3_errmsg(tmp_db));
+		exit(1);
+	}
+
+	sqlite3_bind_int(tmp_stmt, 1, max_cases);
+
+	if (sqlite3_step(tmp_stmt) == SQLITE_ROW) {
+		max_timestamp = sqlite3_column_int64(tmp_stmt, 0);
+		fprintf(stderr, PREF_OK "Found timestamp limit for testcase %zu: %lld\n", max_cases, max_timestamp);
+
+		if (state_mode == FUZZBENCH) {
+			max_bucket = (max_timestamp - FIRST_TC_TIMESTAMP) / bucket_time_limit;
+			fprintf(stderr, PREF_OK "Calculated max bucket: %d\n", max_bucket);
+		}
+	} else {
+		fprintf(stderr, PREF_WARN "Could not find a testcase at limit %zu. Disabling limit.\n", max_cases);
+		max_cases = 0;
+		max_timestamp = 0;
+	}
+
+	sqlite3_finalize(tmp_stmt);
+	sqlite3_close(tmp_db);
+
+}
+
+//This method gets called iff: QUEUE && FUZZBENCH
+//It differs from init_sql() by only fetching chunks of data, so a query gets constructed for the current bucket, and if 
+//bucket is done, the query has to be evaluated again 
+void init_sql_fuzzbench_buckets(){
+	int rc = sqlite3_open_v2(DB_PATH, &db, SQLITE_OPEN_READONLY, NULL);
+	if(rc != SQLITE_OK){
+		fprintf(stderr, PREF_ERR "Cannot open db: %s\n", sqlite3_errmsg(db));
+		exit(1);
+	}
+	fprintf(stderr, PREF_OK "DB opened.\n");
+	sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
+	if(current_bucket == -1){
+		current_bucket = 0;
+	}
+	size_t new_ts_start = FIRST_TC_TIMESTAMP + (current_bucket * bucket_time_limit);
+	size_t new_ts_end = new_ts_start + (bucket_time_limit - 1);
+
+	fprintf(stderr, PREF_WARN "Updating query for new bucket, this might take some time depending on your DB optimiziation...\n");
+	//fflush(stderr);
+
+	//mitigate problem of too many data being fetched in last interval
+	if(max_timestamp > 0 && new_ts_end > max_timestamp){
+		new_ts_end = max_timestamp;
+	}
+
+
+
+	char *queue_sorted_query;
+	//TODO: ADD all crashes etc. to queue selection
+	//
+	if(testset_mode == ALL_CASES){
+
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
+	}else{
+
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
+	}
+	rc = sqlite3_prepare_v2(db, queue_sorted_query, -1, &stmt, NULL);
+	free(queue_sorted_query);
+	if(rc != SQLITE_OK){
+		fprintf(stderr, PREF_ERR "Cannot open db: %s\n", sqlite3_errmsg(db));
+		exit(1);
+	}
+	int rc_queue;
+	if(include_queue){
+		rc_queue = sqlite3_open_v2(DB_PATH_QUEUE, &db_queue, SQLITE_OPEN_READONLY, NULL);
+		if (rc_queue != SQLITE_OK){
+			fprintf(stderr, PREF_ERR "Cannot open db_queue: %s\n", sqlite3_errmsg(db_queue));
+			exit(1);
+		}
+		printf(PREF_OK "queue DB opened.");
+	}
+
+
+
+
+	const char* queue_query = "SELECT id, data FROM queue_cases;";
+	rc_queue = sqlite3_prepare_v2(db_queue, queue_query, -1, &stmt_queue, NULL);
+	if(rc_queue != SQLITE_OK){
+		fprintf(stderr, PREF_ERR "Failed to load initial queue settings!");
+	}
+
+	//this should be enough. We are selecting each TC, which is also listed in queue, plus all other seeds (for first iteration).
+}
+
+void update_query_new_bucket(){
+	char *queue_sorted_query;
+	size_t new_ts_start = FIRST_TC_TIMESTAMP + (current_bucket * bucket_time_limit);
+	size_t new_ts_end = new_ts_start + (bucket_time_limit - 1);
+
+	fprintf(stderr, PREF_WARN "Updating query for new bucket, this might take some time depending on your DB optimiziation...\n");
+	fflush(stderr);
+
+	//mitigate problem of too many data being fetched in last interval
+	if(max_timestamp > 0 && new_ts_end > max_timestamp){
+		new_ts_end = max_timestamp;
+	}
+	if(testset_mode == ALL_CASES){
+
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
+	}else{
+
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
+	}
+	sqlite3_finalize(stmt);
+	int rc = sqlite3_prepare_v2(db, queue_sorted_query, -1, &stmt, NULL);
+	free(queue_sorted_query);
+	if(rc != SQLITE_OK){
+		fprintf(stderr, PREF_ERR "Cannot open db: %s\n", sqlite3_errmsg(db));
+		exit(1);
+	}
+	fprintf(stderr, PREF_OK "Changed db bucket!\n");
+
+}
 void init_sql(){
 	int rc = sqlite3_open_v2(DB_PATH, &db, SQLITE_OPEN_READONLY, NULL);
 	if (rc != SQLITE_OK){
@@ -284,14 +416,13 @@ void init_sql(){
 	if(include_queue){
 		rc_queue = sqlite3_open_v2(DB_PATH_QUEUE, &db_queue, SQLITE_OPEN_READONLY, NULL);
 		if (rc_queue != SQLITE_OK){
-			fprintf(stderr, PREF_ERR "Cannot open db_queue: %s\n", sqlite3_errmsg(db));
+			fprintf(stderr, PREF_ERR "Cannot open db_queue: %s\n", sqlite3_errmsg(db_queue));
 			exit(1);
 		}
 		printf(PREF_OK "queue DB opened.");
-
-
 	}
-	const char *query = NULL;
+	char *query = NULL;
+	char *restart_query = "SELECT id FROM  restarts ORDER BY id ASC;";
 	if (testset_mode == QUEUE_ONLY){
 		if(max_cases){
 			asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases JOIN queue ON queue.id = testcases.id WHERE testcases.id < %zu;", max_cases);
@@ -309,10 +440,9 @@ void init_sql(){
 		fprintf(stderr, "%sUnsupported testset mode!\n", PREF_ERR);
 	}
 
-	const char *restart_query = "SELECT id FROM  restarts ORDER BY id ASC;";
-	
 
 	rc = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
+	if(query) free(query);
 	if(rc != SQLITE_OK){
 		fprintf(stderr, "[!] Failed to prepare query: %s\n", sqlite3_errmsg(db));
 		exit(1);
@@ -325,6 +455,13 @@ void init_sql(){
 	}
 	next_restart = -1;
 
+	//query for seed files 
+	rc = sqlite3_prepare_v2(db, restart_query, -1, &stmt_restart, NULL);
+	if(rc != SQLITE_OK){
+		fprintf(stderr, PREF_ERR "Failed to prepare query for restarts: %s\n", sqlite3_errmsg(db));
+		exit(1);
+	}
+
 	if(!include_queue) return;
 	const char* queue_query = "SELECT id, data FROM queue_cases;";
 	rc_queue = sqlite3_prepare_v2(db_queue, queue_query, -1, &stmt_queue, NULL);
@@ -336,6 +473,7 @@ void init_sql(){
 
 void update_restarts(){
 	//TODO: What if no more restarts? 
+	//HACK: this seems to work somehow 
 	if(sqlite3_step(stmt_restart) == SQLITE_ROW){
 		next_restart = sqlite3_column_int(stmt_restart, 0);
 	}
@@ -367,13 +505,14 @@ pid_t start_target_process(const char *target_path){
 				"-merge=1",
 				"-dump_coverage=1",
 				"-artifact_prefix=./crashes/",
-				"-timeout=" UNIT_TIMEOUT,
+				"-timeout="
+				UNIT_TIMEOUT,
 				"-rss_limit_mb=" RSS_LIMIT_MB,
 				NULL);
 		perror("execl");
 		return -1;
 		exit(1);
-		
+
 	}else if(pid > 0){
 		child_exit_flag = 0;
 		target_pid = pid;
@@ -389,68 +528,70 @@ pid_t start_target_process(const char *target_path){
 }
 
 void restart_target() {
-    sigset_t set, oldset;
-    restarts++;
+	sigset_t set, oldset;
+	restarts++;
 
-    // Block SIGCHLD so handler can't run while we're restarting
-    sigemptyset(&set);
-    sigaddset(&set, SIGCHLD);
-    sigaddset(&set, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &set, &oldset) == -1) {
-        perror("sigprocmask (block)");
-        return;
-    }
+	// Block SIGCHLD so handler can't run while we're restarting
+	sigemptyset(&set);
+	sigaddset(&set, SIGCHLD);
+	sigaddset(&set, SIGTERM);
+	if (sigprocmask(SIG_BLOCK, &set, &oldset) == -1) {
+		perror("sigprocmask (block)");
+		return;
+	}
 
 
-    //check if crash happened
-    if(child_exit_flag){
-	    child_exit_flag = 0;
-    }
+	//check if crash happened
+	if(child_exit_flag){
+		child_exit_flag = 0;
+	}
 
-    // Snapshot PID before handler can change it
-    pid_t pid = target_pid;
+	// Snapshot PID before handler can change it
+	pid_t pid = target_pid;
 
-    if(state_mode == NON_STATEFUL){
-	    goto skip_kill;
-    }
-    if (pid > 1) {
-        if (kill(pid, SIGTERM) == -1 && errno != ESRCH) { //11 bc. TERM does not want to work :()
-            perror("kill");
-        }
-	fprintf(stderr, PREF_WARN "Sent SIGTERM to pid=%d\n", pid);
-    }else{
-	    fprintf(stderr, PREF_WARN "NOT killing target pid=%d\n", pid);
-    }
-skip_kill:
-    ;
-    // Wait for old child to be reaped if it's still around
-    int status = 0;
-    if (pid > 1) {
-        if (waitpid(pid, &status, 0) == -1 && errno != ECHILD) {
-            perror("waitpid");
-        }
-    }
+	//FIX: this was not nice....
+	//if(state_mode == NON_STATEFUL){
+	//        goto skip_kill;
+	//}
+	if (pid > 1) {
+		if (kill(pid, SIGTERM) == -1 && errno != ESRCH) { //11 bc. TERM does not want to work :() 
+			perror("kill");
+		}
+		fprintf(stderr, PREF_WARN "Sent SIGTERM to pid=%d\n", pid);
+	}else{
+		fprintf(stderr, PREF_WARN "NOT killing target pid=%d\n", pid);
+	}
+	//skip_kill:
+	//    ;
+	// Wait for old child to be reaped if it's still around
+	int status = 0;
+	if (pid > 1) {
+		if (waitpid(pid, &status, 0) == -1 && errno != ECHILD) {
+			perror("waitpid");
+		}
+	}
 
-    shm_ptr->target_ready = 0;
-    shm_ptr->ready = 0;
-    shm_ptr->processed = 1;
+	shm_ptr->target_ready = 0;
+	shm_ptr->ready = 0;
+	shm_ptr->processed = 1;
 
-    // Reset crash flags, start fresh target
-    //child_exit_flag = 0;
-    target_pid = start_target_process(argv_glob[1]);
+	// Reset crash flags, start fresh target
+	//child_exit_flag = 0;
+	target_pid = start_target_process(argv_glob[1]);
 
-    sigpending(&set);  // Check pending signals
-    if (sigismember(&set, SIGTERM)) {
-        struct timespec ts = {0};
-        sigtimedwait(&set, NULL, &ts);  // Clear pending SIGTERM
-    }
-    // Restore signal mask (unblock SIGCHLD)
-    if (sigprocmask(SIG_SETMASK, &oldset, NULL) == -1) {
-        perror("sigprocmask (restore)");
-    }
-    fflush(stderr);
+	sigpending(&set);  // Check pending signals
+	if (sigismember(&set, SIGTERM)) {
+		struct timespec ts = {0};
+		sigtimedwait(&set, NULL, &ts);  // Clear pending SIGTERM
+	}
+	// Restore signal mask (unblock SIGCHLD)
+	if (sigprocmask(SIG_SETMASK, &oldset, NULL) == -1) {
+		perror("sigprocmask (restore)");
+	}
+	fflush(stderr);
 
-        }
+	crashes--;
+}
 
 bool send_testcase(const void *data, size_t len){
 	if (len > MAX_INPUT_SIZE){
@@ -460,7 +601,7 @@ bool send_testcase(const void *data, size_t len){
 	//wait if target did not finish prev run, but it shouldnt wait here 
 	while(!shm_ptr->processed && !child_exit_flag) usleep(1000);
 	if(child_exit_flag){
-		fprintf(stderr, PREF_WARN "Restarting inside send_testcase():2...\n");
+		fprintf(stderr, PREF_WARN "Target crashed on TC %zu (or the one before), restarting before sending new one...\n", last_case);
 		restart_target();
 	}
 
@@ -471,8 +612,8 @@ bool send_testcase(const void *data, size_t len){
 
 	while(!shm_ptr->target_ready && !((time(NULL) - last_execution) > EXEC_TIMEOUT)) usleep(1000);
 
-	if((time(NULL) - last_execution) > EXEC_TIMEOUT){
-		//we are in timeout corner :( 
+	if(((time(NULL) - last_execution) > EXEC_TIMEOUT) && !shm_ptr->processed){
+		//we are in timeout corner :(
 		fprintf(stderr, PREF_WARN "Target timed out, restarting...\n");
 		timeouts++;
 		restart_target();
@@ -485,22 +626,25 @@ bool send_testcase(const void *data, size_t len){
 
 	//set last_execution time 
 	last_execution = time(NULL);
-	
+
 	while(!shm_ptr->processed && !child_exit_flag && !((time(NULL) - last_execution) > EXEC_TIMEOUT)) usleep(1000);
 	if(child_exit_flag){
-		fprintf(stderr, PREF_WARN "Restarting inside send_testcase():3...Starting %s\n", argv_glob[1]);
-		
+		//this should be a crash branch I guess, since we just sent the TC and child exit is set
+		fprintf(stderr, PREF_WARN "Target crashed on TC %zu, restarting...\n", last_case);
+
 		restart_target();
+		crashes++;
 	}else if((time(NULL) - last_execution) > EXEC_TIMEOUT){
 		fprintf(stderr, PREF_WARN "Timeout detected, restarting target...\n");
 		restart_target();
+		timeouts++;
 	}
 	return true;
 }
 
 void parse_args(int argc){
 	// CovalyzerHost <target_bin> <crash> <state> <test> (maxTC)
-	char *usage = PREF_ERR "Usage: %s <target_bin> <crashmode> <statemode> <testmode> <instance_id/experiment name> (maxTC)\nHint: expecting main db (link) @ /home/stefan/{db_test.db,db_queue.db} (main + queue db)\nHint: This is not bad coding, this is O(1) coding efficiency.\n";
+	char *usage = PREF_ERR "Usage: %s <target_bin> <crashmode> <statemode> <testmode> <instance_id/experiment name> (maxTC) (bucket_time_limit; default 900=15min)\nHint: expecting main db (link) @ /home/stefan/{db_test.db,db_queue.db} (main + queue db)\nHint: This is not bad coding, this is O(1) coding efficiency.\n";
 	if(argc < 7){
 		fprintf(stderr, usage, argv_glob[0]);
 		exit(1);
@@ -548,17 +692,44 @@ void parse_args(int argc){
 			max_cases = atoi(argv_glob[6]);
 			fprintf(stderr, PREF_WARN "Limited to %zu cases!\n", max_cases);
 		}
+		if(argc >= 8){
+			bucket_time_limit = atoi(argv_glob[7]);
+			fprintf(stderr, PREF_WARN "Set time limit for buckets to %zu seconds!\n", bucket_time_limit);
+		}
+
 
 
 	}
 }
 
+void write_exit_log(){
+	FILE *fp = fopen("result.txt", "w");
+	if (fp == NULL) {
+		perror("Error opening file");
+		return ;
+	}
 
+	fprintf(fp, "===========CCOV STATS============\n");
+	fprintf(fp, "Instance id: %s\n", instance_id);
+	fprintf(fp, "total_execs: %zu\n", total_execs);
+	fprintf(fp, "crashes: %zu\n", crashes);
+	fprintf(fp, "timeouts: %zu\n", timeouts);
+	fprintf(fp, "restarts: %zu\n", restarts);
+	fprintf(fp, "limit: %zu\n", max_cases);
+	fprintf(fp, "last bucket id: %i\n", current_bucket);
+	fprintf(fp, "bucket size limit: %zu\n", bucket_time_limit);
+
+
+	fclose(fp);
+
+	fprintf(stderr, PREF_OK "Information File written successfully.\n");
+	return ;
+}
 
 
 //void restart_target(){
 //	//kill -> wait for signal -> spawn
-//	fprintf(stderr, PREF_WARN "Killing the child (intentional)...\n");
+//	fprintf(stderr, PREF_WARN "Killing the child (intentional)...");
 //	if(target_pid > -1){
 //		kill(target_pid, SIGTERM);
 //	}
@@ -571,52 +742,21 @@ void parse_args(int argc){
 //	restarts++;
 //}
 
-
-void check_bucket_state(time_t time){
-	int current_new = ( (time - first_ts) / 900);
-	if(current_new != current_bucket || current_bucket == -1){
-		//we are in a new window
-		//setup dirs, switch profraw path, merge ...
-		fprintf(stderr, "\n===================\n"PREF_WARN "New bucket. New bucket ID: %03d\n", current_new);
-
-		//char dir[64];
-		//snprintf(dir, sizeof(dir), "bucket_%03d", current_new);
-		//mkdir(dir, 0777);
-		
-		prev_bucket = current_bucket;
-		current_bucket = current_new;
-
-		//snprintf(profraw_path, sizeof(profraw_path), "bucket_%03d/cov-%%m.profraw", current_bucket);
-		//setenv("LLVM_PROFILE_FILE", profraw_path, 1);
-
-		//merge logic
-		if(prev_bucket == -1){
-			//dont merge
-		}else{
-			//merge prev
-		}
-	}
-			
-}
-
-
-
-
 uint8_t is_new_bucket(time_t timestamp){
-	int current_new = ( (timestamp - first_ts) / 900);
+	int current_new = ( (timestamp - first_ts) / bucket_time_limit);
 	if (current_new != current_bucket) return true;
 	return false;
 }
 
 void set_new_bucket(time_t timestamp){
 	prev_bucket = current_bucket;
-	current_bucket = ((timestamp - first_ts) / 900);
+	current_bucket = ((timestamp - first_ts) / bucket_time_limit);
 }
 
 
 
 int main(int argc, char **argv){
-	
+
 	setbuf(stderr, NULL);
 	argv_glob = argv;
 
@@ -642,27 +782,36 @@ int main(int argc, char **argv){
 	sigaddset(&blockSet, SIGTERM);
 	sigprocmask(SIG_BLOCK, &blockSet, &savedSigMask);
 
-// ──────────────────────────────────────────────────────────────────────
+	// ──────────────────────────────────────────────────────────────────────
 
 	init_shm();
-	init_sql();
-	start_target_process(argv[1]);
+	if(max_cases > 0){
+		query_limit_metadata();
+	}
+
+	if(state_mode == FUZZBENCH){
+		init_sql_fuzzbench_buckets();
+	}else{
+		init_sql();
+	}
+
+		start_target_process(argv[1]);
 	fprintf(stderr, "[+] CovalyzerRunner initialized. Sending spying pigeons containing test cases...\n");
 
-//          ╭─────────────────────────────────────────────────────────╮
-//          │                       Queue-runs                        │
-//          ╰─────────────────────────────────────────────────────────╯
+	//          ╭─────────────────────────────────────────────────────────╮
+	//          │                       seed-runs                         │
+	//          ╰─────────────────────────────────────────────────────────╯
 
 	//queue-runs
 	fprintf(stderr, PREF_OK "Executing seeds...\n");
 	while(sqlite3_step(stmt_queue) == SQLITE_ROW){
-		
+
 		//first, fetch data such that it is available for all thingies
 		const void *blob = sqlite3_column_blob(stmt_queue, 1);
 		int blob_size = sqlite3_column_bytes(stmt_queue, 1);
 		int current_id = sqlite3_column_int(stmt_queue, 0);
 
-							
+
 		//check if target should be restarted
 		if(child_exit_flag || state_mode == NON_STATEFUL){
 			fprintf(stderr, PREF_WARN "Restart incoming... Last executed id: [%zu]\n", last_case);
@@ -695,36 +844,66 @@ int main(int argc, char **argv){
 	fprintf(stderr, PREF_OK "\n\nSeed runs finished...\n");
 
 
-//          ╭─────────────────────────────────────────────────────────╮
-//          │                        Real runs                        │
-//          ╰─────────────────────────────────────────────────────────╯
+	//          ╭─────────────────────────────────────────────────────────╮
+	//          │                        Real runs                        │
+	//          ╰─────────────────────────────────────────────────────────╯
 
 	size_t count = 0;
 	size_t last_case = 0;
-	while(sqlite3_step(stmt) == SQLITE_ROW && count <= max_cases){
-		
+	size_t last_timestamp = 0;
+
+	//Ok, so, normally, in all runs except fuzzbench, we fetch "all" data "at once" (we use step though), and we cancel when sql says enough. But for fuzzbench mode, we must query for each bucket individually, thus, this has to be altered
+	//while(sqlite3_step(stmt) == SQLITE_ROW && count <= max_cases){
+	while(1){
+
+		if(count == 0 && state_mode == FUZZBENCH){
+			first_ts = FIRST_TC_TIMESTAMP;
+			set_new_bucket(FIRST_TC_TIMESTAMP);
+		}
+
+		//loop cancel conditions
+		if(sqlite3_step(stmt) != SQLITE_ROW || (max_cases > 0 && count > max_cases)){
+			if(state_mode == FUZZBENCH){
+				//We assume this: we are in a new bucket, since there are no more entries left from the current bucket, thus, we update the bucket number and update the query
+				//FIX:this needs to be fixeda
+				current_bucket++;
+				if(max_bucket != -1 && current_bucket > max_bucket){
+					fprintf(stderr, "\n" PREF_OK "Reached max. bucket limit. We are done here.\n");
+					break;
+				}
+				update_query_new_bucket();
+				backup_cov();
+				continue;
+
+			}else{
+				break;
+			}
+		}
+
 		//first, fetch data such that it is available for all thingies
 		const void *blob = sqlite3_column_blob(stmt, 0);
+		//FIX: use size field
 		int blob_size = sqlite3_column_bytes(stmt, 0);
 		int current_id = sqlite3_column_int(stmt, 1);
 		const char *time_str = (const char *)sqlite3_column_text(stmt, 2);
 		time_t timestamp = (time_t)atol(time_str); //(time_t) sqlite3_column_int64(stmt, 2);
 
-		if(count == 0 ){
+		if(count == 0 && state_mode != FUZZBENCH){
 			first_ts = timestamp;
 			set_new_bucket(timestamp);
 			fprintf(stderr, PREF_WARN "First bucket id is: %i\n", current_bucket);
 		}
-					
+
 		//check if target should be restarted
-		if(((last_case == next_restart) && state_mode != FUZZBENCH) || (is_new_bucket(timestamp) && state_mode == FUZZBENCH) || child_exit_flag || state_mode == NON_STATEFUL){
+		if(((last_case == next_restart) && state_mode != FUZZBENCH) || child_exit_flag || state_mode == NON_STATEFUL){
 			fprintf(stderr, PREF_WARN "Restart incoming... Last executed id: [%zu]\n", last_case);
-			if(is_new_bucket(timestamp) && state_mode == FUZZBENCH){
-				fprintf(stderr, PREF_WARN "Restart bc. new time bucket\n");
-				backup_cov();
-				set_new_bucket(timestamp);
-				restart_target();
-			}else if(last_case == next_restart){
+			//if(is_new_bucket(timestamp) && state_mode == FUZZBENCH && testset_mode == ALL_CASES){
+			//	fprintf(stderr, PREF_WARN "Restart bc. new time bucket\n");
+			//	backup_cov();
+			//	set_new_bucket(timestamp);
+			//	restart_target();
+			//}else 
+			if(last_case == next_restart){
 				fprintf(stderr, PREF_WARN "Restart was planned by database\n");
 				update_restarts();
 				restart_target();
@@ -738,34 +917,40 @@ int main(int argc, char **argv){
 			}
 		}
 
-		//check if we have to copy 
-		if(is_new_bucket(timestamp) ){
-			backup_cov();
-			if(state_mode != FUZZBENCH){
-				set_new_bucket(timestamp);
-			}
-		}
+		//check if we have to copy (backup in fb q mode is done in loop cancel)
+		//if(state_mode == FUZZBENCH && testset_mode == ALL_CASES){
+		//	if(is_new_bucket(timestamp) ){
+		//		backup_cov();
+		//		if(state_mode != FUZZBENCH){
+		//			set_new_bucket(timestamp);
+		//		}
+		//	}
+
+		//}
 
 
 		//send testcase, print progress...
 		last_case = current_id;
 		if(blob && blob_size > 0){
 			if(send_testcase(blob, (size_t)blob_size)){
-				double progress = (max_cases > 0) ? ((double)current_id/ max_cases) * 100.0 : 0.0;
+				double progress = (max_cases > 0) ? ((double)total_execs/ max_cases) * 100.0 : 0.0;
 				if(state_mode == FUZZBENCH){
-					fprintf(stderr, "\r" PREF_OK "Progress: [%.1f%%] | Crashes: [%zu] | Restarts: [%zu] | Bucket: [%i] | Executed testcase ID %d (%d bytes)", progress, crashes, restarts, current_bucket, current_id, blob_size);
+					fprintf(stderr, "\r" PREF_OK "Progress: [%.1f%%] | Crashes: [%zu] | Restarts: [%zu] | Timeouts: [%zu] | Bucket: [%i] | total_execs: [%zu] | Executed testcase ID %d (%d bytes)", progress, crashes, restarts, timeouts, current_bucket, total_execs, current_id, blob_size);
 					fflush(stderr);	
 				}else{
-					fprintf(stderr, "\r" PREF_OK "Progress: [%.1f%%] | Crashes: [%zu] | Restarts: [%zu] | Executed testcase ID %d (%d bytes)", progress, crashes, restarts, current_id, blob_size);
+					fprintf(stderr, "\r" PREF_OK "Progress: [%.1f%%] | Crashes: [%zu] | Restarts: [%zu] | Timeouts: [%zu] | total_execs: [%zu] | Executed testcase ID %d (%d bytes)", progress, crashes, restarts, timeouts, total_execs, current_id, blob_size);
 				}
 				//save exec time 
 			}
 		}
 		count++;
+		total_execs++;
 	}
 	fprintf(stderr, "\n" PREF_OK "Executed all cases, KILLING OUR CHILD...\n");
 	run_dead = 1;
 	fprintf(stderr, PREF_OK "Done.\n");
+	write_exit_log();
+
 	cleanup();
 	return 0;
 }
