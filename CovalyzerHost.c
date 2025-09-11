@@ -328,7 +328,7 @@ void init_sql_fuzzbench_buckets(){
 	size_t new_ts_start = FIRST_TC_TIMESTAMP + (current_bucket * bucket_time_limit);
 	size_t new_ts_end = new_ts_start + (bucket_time_limit - 1);
 
-	fprintf(stderr, PREF_WARN "Updating query for new bucket, this might take some time depending on your DB optimiziation...\n");
+	fprintf(stderr, PREF_WARN "\nUpdating query for new bucket, this might take some time depending on your DB optimiziation...\n");
 	//fflush(stderr);
 
 	//mitigate problem of too many data being fetched in last interval
@@ -343,10 +343,10 @@ void init_sql_fuzzbench_buckets(){
 	//
 	if(testset_mode == ALL_CASES){
 
-		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
 	}else{
 
-		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
 	}
 	rc = sqlite3_prepare_v2(db, queue_sorted_query, -1, &stmt, NULL);
 	free(queue_sorted_query);
@@ -390,10 +390,10 @@ void update_query_new_bucket(){
 	}
 	if(testset_mode == ALL_CASES){
 
-		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
 	}else{
 
-		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, LENGTH(value) AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
+		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;", new_ts_start, new_ts_end, new_ts_start, new_ts_end);
 	}
 	sqlite3_finalize(stmt);
 	int rc = sqlite3_prepare_v2(db, queue_sorted_query, -1, &stmt, NULL);
