@@ -893,6 +893,10 @@ int main(int argc, char **argv){
 			set_new_bucket(timestamp);
 			fprintf(stderr, PREF_WARN "First bucket id is: %i\n", current_bucket);
 		}
+		if(is_new_bucket(timestamp)){
+			backup_cov();
+			set_new_bucket(timestamp);
+		}
 
 		//check if target should be restarted
 		if(((last_case == next_restart) && state_mode != FUZZBENCH) || child_exit_flag || state_mode == NON_STATEFUL){
