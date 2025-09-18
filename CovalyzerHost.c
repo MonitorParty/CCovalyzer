@@ -339,8 +339,6 @@ void init_sql_fuzzbench_buckets(){
 
 
 	char *queue_sorted_query;
-	//TODO: ADD all crashes etc. to queue selection
-	//
 	if(testset_mode == ALL_CASES){
 
 		asprintf(&queue_sorted_query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases WHERE testcases.timestamp BETWEEN %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY size ASC;"   , FIRST_TC_TIMESTAMP, new_ts_end, FIRST_TC_TIMESTAMP, new_ts_end);
@@ -411,29 +409,27 @@ void init_sql(){
 		fprintf(stderr, PREF_ERR "Cannot open db: %s\n", sqlite3_errmsg(db));
 		exit(1);
 	}
+	printf(PREF_OK "queue DB opened.");
+	sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
 	printf(PREF_OK "DB opened.");
-	int rc_queue;
-	if(include_queue){
-		rc_queue = sqlite3_open_v2(DB_PATH_QUEUE, &db_queue, SQLITE_OPEN_READONLY, NULL);
-		if (rc_queue != SQLITE_OK){
-			fprintf(stderr, PREF_ERR "Cannot open db_queue: %s\n", sqlite3_errmsg(db_queue));
-			exit(1);
-		}
-		printf(PREF_OK "queue DB opened.");
-	}
 	char *query = NULL;
-	char *restart_query = "SELECT id FROM  restarts ORDER BY id ASC;";
+		char *restart_query = "SELECT id FROM  restarts ORDER BY id ASC;";
 	if (testset_mode == QUEUE_ONLY){
 		if(max_cases){
-			asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases JOIN queue ON queue.id = testcases.id WHERE testcases.id < %zu;", max_cases);
+			asprintf(&query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases JOIN queue ON testcases.id = queue.id WHERE queue.timestamp BETWEEN  %zu AND %zu UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY timestamp ASC;", 0, max_timestamp, 0, max_timestamp );
+			//asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases JOIN queue ON queue.id = testcases.id WHERE testcases.id < %zu;", max_cases);
 		}else{
+			//FIXME: This is old.
 			asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases JOIN queue ON queue.id = testcases.id;");
 		}
 	}else if( testset_mode == ALL_CASES){
 		if(max_cases){
-			asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases WHERE testcases.id < %zu;", max_cases);
+
+			asprintf(&query, "SELECT value, id, timestamp, size FROM (SELECT testcases.id AS id, testcases.value AS value, testcases.timestamp AS timestamp, testcases.size AS size, 'testcase' as source FROM testcases UNION ALL SELECT crashes_hangs.id AS id, crashes_hangs.data AS value, crashes_hangs.time AS timestamp, crashes_hangs.size AS size, 'crash_hang' AS source FROM crashes_hangs WHERE crashes_hangs.time BETWEEN %zu AND  %zu ) ORDER BY timestamp ASC;", 0, max_timestamp, 0, max_timestamp);
+			//asprintf(&query, "SELECT testcases.value, testcases.id, testcases.timestamp FROM testcases WHERE testcases.id < %zu;", max_cases);
 
 		}else{
+			//FIXME: This is old
 			query = "SELECT value, id, timestamp FROM testcases;";
 		}
 	}else{
@@ -455,19 +451,24 @@ void init_sql(){
 	}
 	next_restart = -1;
 
-	//query for seed files 
-	rc = sqlite3_prepare_v2(db, restart_query, -1, &stmt_restart, NULL);
-	if(rc != SQLITE_OK){
-		fprintf(stderr, PREF_ERR "Failed to prepare query for restarts: %s\n", sqlite3_errmsg(db));
-		exit(1);
-	}
+	int rc_queue;
+		rc_queue = sqlite3_open_v2(DB_PATH_QUEUE, &db_queue, SQLITE_OPEN_READONLY, NULL);
+		if (rc_queue != SQLITE_OK){
+			fprintf(stderr, PREF_ERR "Cannot open db_queue: %s\n", sqlite3_errmsg(db_queue));
+			exit(1);
+		}
+		printf(PREF_OK "queue DB opened.");
 
-	if(!include_queue) return;
+
+
+
 	const char* queue_query = "SELECT id, data FROM queue_cases;";
 	rc_queue = sqlite3_prepare_v2(db_queue, queue_query, -1, &stmt_queue, NULL);
 	if(rc_queue != SQLITE_OK){
 		fprintf(stderr, PREF_ERR "Failed to load initial queue settings!");
 	}
+
+
 
 }
 
@@ -855,6 +856,7 @@ int main(int argc, char **argv){
 	//Ok, so, normally, in all runs except fuzzbench, we fetch "all" data "at once" (we use step though), and we cancel when sql says enough. But for fuzzbench mode, we must query for each bucket individually, thus, this has to be altered
 	//while(sqlite3_step(stmt) == SQLITE_ROW && count <= max_cases){
 	while(1){
+		int rc = sqlite3_step(stmt);
 
 		if(count == 0 && state_mode == FUZZBENCH){
 			first_ts = FIRST_TC_TIMESTAMP;
@@ -862,10 +864,8 @@ int main(int argc, char **argv){
 		}
 
 		//loop cancel conditions
-		if(sqlite3_step(stmt) != SQLITE_ROW || (max_cases > 0 && count > max_cases)){
+		if(rc != SQLITE_ROW || (max_cases > 0 && count > max_cases)){
 			if(state_mode == FUZZBENCH){
-				//We assume this: we are in a new bucket, since there are no more entries left from the current bucket, thus, we update the bucket number and update the query
-				//FIX:this needs to be fixeda
 				current_bucket++;
 				if(max_bucket != -1 && current_bucket > max_bucket){
 					fprintf(stderr, "\n" PREF_OK "Reached max. bucket limit. We are done here.\n");
